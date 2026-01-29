@@ -15,21 +15,21 @@ jobs:
       - name: Get latest code
         uses: actions/checkout@v4
 
-      # 2) 安裝 PHP + Composer
+      # 2) 安裝 PHP + Composer（只在 CI 使用）
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.3"
           tools: composer:v2
 
-      # 3) 安裝 Node（用來 build 前端資產）
+      # 3) 安裝 Node（build 前端）
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "latest"
           cache: "npm"
 
-      # 4) 安裝後端依賴（只安裝 production）
+      # 4) 安裝後端依賴（production）
       - name: Install Composer dependencies
         run: composer install --no-dev --optimize-autoloader
 
@@ -37,22 +37,24 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      # 6) 打包前端
+      # 6) 打包前端資產
       - name: Build project
         run: npm run build
 
-      # 7) 由 .env.example 產生 .env.deploy，並覆蓋 secrets
+      # 7) 由 .env.example 產生 .env.deploy，並注入 secrets
       - name: Prepare .env from .env.example
         env:
           APP_ENV: production
           APP_DEBUG: "false"
           APP_KEY: ${{ secrets.APP_KEY }}
+
           DB_CONNECTION: mysql
           DB_HOST: 127.0.0.1
           DB_PORT: "3306"
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
           MAIL_MAILER: smtp
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_PORT: "587"
@@ -69,11 +71,10 @@ jobs:
               lines = f.read().splitlines()
 
           def set_key(lines, key, value):
-              if value is None or value == "":
+              if not value:
                   return lines
               pattern = re.compile(rf"^{re.escape(key)}=")
-              out = []
-              found = False
+              out, found = [], False
               for line in lines:
                   if pattern.match(line):
                       out.append(f"{key}={value}")
@@ -114,7 +115,7 @@ jobs:
         run: |
           rm -rf node_modules .git .github tests
 
-      # 9) 上傳到主機
+      # 9) 上傳到主機（完整專案，含 vendor / public build）
       - name: Deploy via SCP
         uses: appleboy/scp-action@v0.1.4
         with:
@@ -125,8 +126,8 @@ jobs:
           source: "./"
           target: ${{ secrets.SITE_PATH }}
 
-      # 10) 主機端處理：建立資料夾、搬移 .env、建立 storage 連結、清快取
-      - name: SSH Execute Commands (Links & Cache)
+      # 10) 主機端處理（不跑 composer）
+      - name: SSH Execute Commands (Finalize)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -138,48 +139,35 @@ jobs:
 
             SITE_PATH="${{ secrets.SITE_PATH }}"
 
-            # (A) 如果資料夾不存在就建立
             mkdir -p "$SITE_PATH"
-
-            # (B) 進入專案根目錄
             cd "$SITE_PATH"
 
-            # (C) 防呆：確認這裡真的是 Laravel 根目錄（有 artisan）
+            # 防呆：確認 Laravel 根目錄
             if [ ! -f artisan ]; then
               echo "ERROR: artisan not found in SITE_PATH=$SITE_PATH"
               echo "PWD=$(pwd)"
-              echo "List current dir:"
               ls -la
-              echo "Tip: SITE_PATH should be Laravel project root (the folder containing artisan)."
               exit 1
             fi
 
-            # 使用部署時產生的 .env.deploy 覆蓋 .env（包含 secrets）
+            # .env.deploy → .env
             if [ -f .env.deploy ]; then
               mv .env.deploy .env
+              chmod 600 .env || true
             fi
 
-            # 主機端 composer：如果主機沒有 composer，就跳過（避免整個 job 紅掉）
-            if command -v composer >/dev/null 2>&1; then
-              composer install --no-dev --optimize-autoloader
-            else
-              echo "WARN: composer not found on server; skipping composer install."
-            fi
-
-            # storage:link（用 ln，避免 artisan storage:link 被禁）
+            # storage link（不用 artisan）
             rm -rf public/storage
             ln -sfn "$SITE_PATH/storage/app/public" "$SITE_PATH/public/storage"
 
-            # 清快取（php artisan 可能存在但 php/權限有問題；失敗就印錯但不中斷可自行調整）
+            # 清快取
             if command -v php >/dev/null 2>&1; then
               php artisan config:clear || true
               php artisan route:clear  || true
               php artisan view:clear   || true
               php artisan cache:clear  || true
-            else
-              echo "WARN: php not found on server; skipping artisan cache clears."
             fi
 
-            # 清除不必要檔案/暫存（主機端）
+            # 清理殘留檔案
             rm -rf .git .github node_modules || true
             rm -f "$HOME"/*.tar.gz || true
