@@ -20,7 +20,7 @@
             </div>
         </div>
         <a href="https://www.great-good.tw" aria-label="鬼谷網頁設計" target="_blank">
-            <flux:badge color="red">GD CMS</flux:badge>
+            <flux:badge color="red">GD 2</flux:badge>
         </a>
     </div>
     <script src="https://unpkg.com/p5@1.9.2/lib/p5.min.js"></script>
