@@ -1,0 +1,163 @@
+name: 20260130Laravel+Livewire網站部署到cPanel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  web-deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) 取得程式碼
+      - name: Get latest code
+        uses: actions/checkout@v4
+
+      # 2) 安裝 PHP + Composer
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: composer:v2
+
+      # 3) 安裝 Node（用來 build 前端資產）
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+          cache: "npm"
+
+      # 4) 安裝後端依賴（只安裝 production）
+      - name: Install Composer dependencies
+        run: composer install --no-dev --optimize-autoloader
+
+      # 5) 安裝前端依賴
+      - name: Install npm dependencies
+        run: npm ci
+
+      # 6) 打包前端
+      - name: Build project
+        run: npm run build
+
+      # 7) 由 .env.example 產生 .env.deploy，並覆蓋 secrets
+      #    注意：APP_KEY 由 GitHub Secrets 提供，不要在部署流程中重新產生
+      - name: Prepare .env from .env.example
+        env:
+          # 正式站建議改成 production
+          APP_ENV: production
+          APP_DEBUG: "false"
+          APP_KEY: ${{ secrets.APP_KEY }}
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: "3306"
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          MAIL_MAILER: smtp
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: "587"
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM_ADDRESS: ${{ secrets.MAIL_USERNAME }}
+        run: |
+          cp .env.example .env.deploy
+          python - <<'PY'
+          import os, re
+
+          path = ".env.deploy"
+          with open(path, "r", encoding="utf-8") as f:
+              lines = f.read().splitlines()
+
+          def set_key(lines, key, value):
+              if value is None or value == "":
+                  return lines
+              pattern = re.compile(rf"^{re.escape(key)}=")
+              out = []
+              found = False
+              for line in lines:
+                  if pattern.match(line):
+                      out.append(f"{key}={value}")
+                      found = True
+                  else:
+                      out.append(line)
+              if not found:
+                  out.append(f"{key}={value}")
+              return out
+
+          values = {
+              "APP_ENV": os.getenv("APP_ENV"),
+              "APP_DEBUG": os.getenv("APP_DEBUG"),
+              "APP_KEY": os.getenv("APP_KEY"),
+              "DB_CONNECTION": os.getenv("DB_CONNECTION"),
+              "DB_HOST": os.getenv("DB_HOST"),
+              "DB_PORT": os.getenv("DB_PORT"),
+              "DB_DATABASE": os.getenv("DB_DATABASE"),
+              "DB_USERNAME": os.getenv("DB_USERNAME"),
+              "DB_PASSWORD": os.getenv("DB_PASSWORD"),
+              "MAIL_MAILER": os.getenv("MAIL_MAILER"),
+              "MAIL_HOST": os.getenv("MAIL_HOST"),
+              "MAIL_PORT": os.getenv("MAIL_PORT"),
+              "MAIL_USERNAME": os.getenv("MAIL_USERNAME"),
+              "MAIL_PASSWORD": os.getenv("MAIL_PASSWORD"),
+              "MAIL_FROM_ADDRESS": os.getenv("MAIL_FROM_ADDRESS"),
+          }
+
+          for k, v in values.items():
+              lines = set_key(lines, k, v)
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+
+      # 8) 移除不需上傳的檔案
+      - name: Prune deploy files
+        run: |
+          rm -rf node_modules .git .github tests
+
+      # 9) 上傳到主機（SITE_PATH 請填完整絕對路徑，如 /home/xxx/your_app）
+      #    cPanel 請在網域設定中把 Document Root 指到 $SITE_PATH/public
+      - name: Deploy via SCP
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "./"
+          target: ${{ secrets.SITE_PATH }}
+
+      # 10) 主機端處理：搬移 .env、建立 storage 連結、清快取
+      - name: SSH Execute Commands (Links & Cache)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            SITE_PATH="${{ secrets.SITE_PATH }}"
+            cd "$SITE_PATH" || exit 1
+
+            # 使用部署時產生的 .env.deploy 覆蓋 .env（包含 secrets）
+            if [ -f .env.deploy ]; then
+              mv .env.deploy .env
+            fi
+
+            # 主機端再跑一次 composer，確保 vendor 在主機是完整的
+            composer install --no-dev --optimize-autoloader
+
+            # storage:link 在主機可能被禁用 exec/symlink，改用 ln 指令
+            rm -rf public/storage
+            ln -sfn "$SITE_PATH/storage/app/public" "$SITE_PATH/public/storage"
+
+            # 清掉舊快取
+            php artisan config:clear
+            php artisan route:clear
+            php artisan view:clear
+            php artisan cache:clear
+
+            # 清除不必要檔案/暫存
+            rm -rf .git .github node_modules
+            rm -f "$HOME"/*.tar.gz
