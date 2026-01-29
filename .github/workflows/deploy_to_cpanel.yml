@@ -42,10 +42,8 @@ jobs:
         run: npm run build
 
       # 7) 由 .env.example 產生 .env.deploy，並覆蓋 secrets
-      #    注意：APP_KEY 由 GitHub Secrets 提供，不要在部署流程中重新產生
       - name: Prepare .env from .env.example
         env:
-          # 正式站建議改成 production
           APP_ENV: production
           APP_DEBUG: "false"
           APP_KEY: ${{ secrets.APP_KEY }}
@@ -116,8 +114,7 @@ jobs:
         run: |
           rm -rf node_modules .git .github tests
 
-      # 9) 上傳到主機（SITE_PATH 請填完整絕對路徑，如 /home/xxx/your_app）
-      #    cPanel 請在網域設定中把 Document Root 指到 $SITE_PATH/public
+      # 9) 上傳到主機
       - name: Deploy via SCP
         uses: appleboy/scp-action@v0.1.4
         with:
@@ -128,7 +125,7 @@ jobs:
           source: "./"
           target: ${{ secrets.SITE_PATH }}
 
-      # 10) 主機端處理：搬移 .env、建立 storage 連結、清快取
+      # 10) 主機端處理：建立資料夾、搬移 .env、建立 storage 連結、清快取
       - name: SSH Execute Commands (Links & Cache)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -137,27 +134,52 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
+            set -e
+
             SITE_PATH="${{ secrets.SITE_PATH }}"
-            cd "$SITE_PATH" || exit 1
+
+            # (A) 如果資料夾不存在就建立
+            mkdir -p "$SITE_PATH"
+
+            # (B) 進入專案根目錄
+            cd "$SITE_PATH"
+
+            # (C) 防呆：確認這裡真的是 Laravel 根目錄（有 artisan）
+            if [ ! -f artisan ]; then
+              echo "ERROR: artisan not found in SITE_PATH=$SITE_PATH"
+              echo "PWD=$(pwd)"
+              echo "List current dir:"
+              ls -la
+              echo "Tip: SITE_PATH should be Laravel project root (the folder containing artisan)."
+              exit 1
+            fi
 
             # 使用部署時產生的 .env.deploy 覆蓋 .env（包含 secrets）
             if [ -f .env.deploy ]; then
               mv .env.deploy .env
             fi
 
-            # 主機端再跑一次 composer，確保 vendor 在主機是完整的
-            composer install --no-dev --optimize-autoloader
+            # 主機端 composer：如果主機沒有 composer，就跳過（避免整個 job 紅掉）
+            if command -v composer >/dev/null 2>&1; then
+              composer install --no-dev --optimize-autoloader
+            else
+              echo "WARN: composer not found on server; skipping composer install."
+            fi
 
-            # storage:link 在主機可能被禁用 exec/symlink，改用 ln 指令
+            # storage:link（用 ln，避免 artisan storage:link 被禁）
             rm -rf public/storage
             ln -sfn "$SITE_PATH/storage/app/public" "$SITE_PATH/public/storage"
 
-            # 清掉舊快取
-            php artisan config:clear
-            php artisan route:clear
-            php artisan view:clear
-            php artisan cache:clear
+            # 清快取（php artisan 可能存在但 php/權限有問題；失敗就印錯但不中斷可自行調整）
+            if command -v php >/dev/null 2>&1; then
+              php artisan config:clear || true
+              php artisan route:clear  || true
+              php artisan view:clear   || true
+              php artisan cache:clear  || true
+            else
+              echo "WARN: php not found on server; skipping artisan cache clears."
+            fi
 
-            # 清除不必要檔案/暫存
-            rm -rf .git .github node_modules
-            rm -f "$HOME"/*.tar.gz
+            # 清除不必要檔案/暫存（主機端）
+            rm -rf .git .github node_modules || true
+            rm -f "$HOME"/*.tar.gz || true
